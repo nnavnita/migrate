@@ -1,0 +1,31 @@
+{
+  "name": "migrate",
+  "version": "0.1.0",
+  "description": "Auto-migrate undone TODOs into today's journal on creation.",
+  "main": "dist/index.html",
+  "author": "nnavnita",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nnavnita/migrate"
+  },
+  "logseq": {
+    "id": "migrate",
+    "title": "Migrate",
+    "icon": "./icon.png"
+  },
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "vite build"
+  },
+  "devDependencies": {
+    "@logseq/libs": "^0.0.17",
+    "typescript": "^5.4.0",
+    "vite": "^5.2.0"
+  },
+  "files": [
+    "dist",
+    "icon.png",
+    "README.md"
+  ]
+}
