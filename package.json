@@ -1,6 +1,6 @@
 {
   "name": "migrate",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Auto-migrate undone TODOs into today's journal on creation.",
   "main": "dist/index.html",
   "author": "nnavnita",

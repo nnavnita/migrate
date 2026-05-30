@@ -268,7 +268,7 @@ function main() {
     },
   );
 
-  void runWithToast();
+  setTimeout(() => void runWithToast(), 0);
 }
 
 logseq.ready(main).catch(console.error);
