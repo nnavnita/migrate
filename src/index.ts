@@ -111,130 +111,219 @@ async function findUndoneBlocks(
        [?p :block/journal-day ?d]
        [(< ?d ${todayDay})]]
   `;
+  console.info("[migrate] query", { todayDay, markers });
   const res = (await logseq.DB.datascriptQuery(query)) as
     | BlockEntity[][]
     | null;
+  console.info("[migrate] query result rows:", res?.length ?? 0);
   if (!res) return [];
   return res.flat();
 }
 
+async function findJournalByDay(day: number): Promise<PageEntity | null> {
+  const query = `
+    [:find (pull ?p [*])
+     :where
+       [?p :block/journal? true]
+       [?p :block/journal-day ${day}]]
+  `;
+  const res = (await logseq.DB.datascriptQuery(query)) as
+    | PageEntity[][]
+    | null;
+  const page = res?.[0]?.[0];
+  return page ?? null;
+}
+
 async function ensureTodayJournal(): Promise<PageEntity | null> {
+  const todayDay = todayJournalDay();
+  let page = await findJournalByDay(todayDay);
+  if (page) return page;
+
   const cfg = await logseq.App.getUserConfigs();
   const fmt: string = cfg.preferredDateFormat ?? "yyyy-MM-dd";
   const title = formatDate(new Date(), fmt);
-  let page = await logseq.Editor.getPage(title);
+  console.info("[migrate] no journal found by day; creating", { title });
+  await logseq.Editor.createPage(
+    title,
+    {},
+    { journal: true, redirect: false, createFirstBlock: true },
+  );
+  page = await findJournalByDay(todayDay);
   if (!page) {
-    page = await logseq.Editor.createPage(
+    console.warn("[migrate] created page but journal-day query still empty", {
       title,
-      {},
-      { journal: true, redirect: false, createFirstBlock: true },
-    );
+    });
   }
   return page;
 }
 
 function formatDate(d: Date, fmt: string): string {
   const pad = (n: number) => String(n).padStart(2, "0");
+  const day = d.getDate();
   const map: Record<string, string> = {
     yyyy: String(d.getFullYear()),
-    MM: pad(d.getMonth() + 1),
-    M: String(d.getMonth() + 1),
-    dd: pad(d.getDate()),
-    d: String(d.getDate()),
-    EEEE: d.toLocaleDateString("en-US", { weekday: "long" }),
-    EEE: d.toLocaleDateString("en-US", { weekday: "short" }),
     MMMM: d.toLocaleDateString("en-US", { month: "long" }),
     MMM: d.toLocaleDateString("en-US", { month: "short" }),
-    o: ordinalSuffix(d.getDate()),
+    MM: pad(d.getMonth() + 1),
+    M: String(d.getMonth() + 1),
+    do: day + ordinalSuffix(day),
+    dd: pad(day),
+    d: String(day),
+    EEEE: d.toLocaleDateString("en-US", { weekday: "long" }),
+    EEE: d.toLocaleDateString("en-US", { weekday: "short" }),
+    o: ordinalSuffix(day),
   };
-  return fmt.replace(/yyyy|MMMM|MMM|MM|M|dd|d|EEEE|EEE|o/g, (k) => map[k] ?? k);
+  return fmt.replace(/yyyy|MMMM|MMM|MM|M|do|dd|d|EEEE|EEE|o/g, (k) => map[k] ?? k);
 }
 
 function ordinalSuffix(n: number): string {
   const s = ["th", "st", "nd", "rd"];
   const v = n % 100;
-  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+  return s[(v - 20) % 10] || s[v] || s[0];
 }
 
-async function migrate(): Promise<{ moved: number; skipped: number }> {
-  const s = logseq.settings as unknown as Settings;
-  if (!s.enabled) return { moved: 0, skipped: 0 };
+async function migrate(): Promise<{
+  moved: number;
+  skipped: number;
+  reason?: string;
+}> {
+  const s = (logseq.settings ?? {}) as unknown as Settings;
+  const enabled = s.enabled ?? true;
+  if (!enabled) {
+    console.info("[migrate] disabled in settings");
+    return { moved: 0, skipped: 0, reason: "disabled" };
+  }
 
   const todayDay = todayJournalDay();
   if (s.lastMigratedDate === String(todayDay)) {
-    return { moved: 0, skipped: 0 };
+    console.info("[migrate] already ran today", { todayDay });
+    return { moved: 0, skipped: 0, reason: "already-ran" };
   }
 
-  const markers = parseMarkers(s.markers);
-  if (markers.length === 0) return { moved: 0, skipped: 0 };
+  const markers = parseMarkers(s.markers ?? "TODO,DOING,LATER,NOW");
+  if (markers.length === 0) {
+    console.info("[migrate] no valid markers configured");
+    return { moved: 0, skipped: 0, reason: "no-markers" };
+  }
 
   const todayPage = await ensureTodayJournal();
-  if (!todayPage) return { moved: 0, skipped: 0 };
+  if (!todayPage) {
+    console.warn("[migrate] could not resolve today's journal page");
+    return { moved: 0, skipped: 0, reason: "no-today-page" };
+  }
+  console.info("[migrate] today page", {
+    id: todayPage.id,
+    name: todayPage.name,
+  });
 
   const blocks = await findUndoneBlocks(markers, todayDay);
+  console.info("[migrate] undone blocks pre-filter:", blocks.length);
 
+  const filterMode = (s.filterMode ?? "all") as FilterMode;
+  const filterTag = s.filterTag ?? "migrate";
   const filtered = blocks.filter((b) => {
     if (b.page?.id === todayPage.id) return false;
     const content = b.content ?? "";
-    if (s.filterMode === "exclude-tagged") return !hasHashtag(content, s.filterTag);
-    if (s.filterMode === "only-tagged") return hasHashtag(content, s.filterTag);
+    if (filterMode === "exclude-tagged") return !hasHashtag(content, filterTag);
+    if (filterMode === "only-tagged") return hasHashtag(content, filterTag);
     return true;
   });
+  console.info("[migrate] blocks to migrate:", filtered.length);
 
   let moved = 0;
   let skipped = 0;
 
   const tree = await logseq.Editor.getPageBlocksTree(todayPage.name);
   const anchor = tree?.[tree.length - 1];
+  const moveStyle = (s.moveStyle ?? "move") as MoveStyle;
 
   let prevUuid: string | undefined = anchor?.uuid;
 
+  console.info("[migrate] anchor", { anchorUuid: anchor?.uuid, moveStyle });
   for (const b of filtered) {
+    const content = b.content ?? "";
+    console.info("[migrate] processing", {
+      uuid: b.uuid,
+      content: content.slice(0, 60),
+      pageId: b.page?.id,
+      prevUuid,
+    });
     try {
-      if (s.moveStyle === "move-with-ref") {
+      if (moveStyle === "move-with-ref") {
         const refContent = `((${b.uuid}))`;
+        let inserted: BlockEntity | null = null;
         if (prevUuid) {
-          await logseq.Editor.insertBlock(prevUuid, refContent, {
+          inserted = await logseq.Editor.insertBlock(prevUuid, refContent, {
             sibling: true,
           });
         } else {
-          await logseq.Editor.appendBlockInPage(todayPage.name, refContent);
+          inserted = await logseq.Editor.appendBlockInPage(
+            todayPage.name,
+            refContent,
+          );
         }
+        if (inserted) prevUuid = inserted.uuid;
         moved++;
       } else {
+        let inserted: BlockEntity | null = null;
         if (prevUuid) {
-          await logseq.Editor.moveBlock(b.uuid, prevUuid, { before: false });
+          console.info("[migrate] insertBlock copy", {
+            target: prevUuid,
+            len: content.length,
+          });
+          inserted = await logseq.Editor.insertBlock(prevUuid, content, {
+            sibling: true,
+          });
         } else {
-          const fallback = await logseq.Editor.appendBlockInPage(
+          console.info("[migrate] appendBlockInPage copy");
+          inserted = await logseq.Editor.appendBlockInPage(
             todayPage.name,
-            b.content,
+            content,
           );
-          if (fallback) {
-            prevUuid = fallback.uuid;
-            await logseq.Editor.removeBlock(b.uuid);
-          }
         }
+        if (!inserted) {
+          console.warn("[migrate] insert returned null, leaving source intact");
+          skipped++;
+          continue;
+        }
+        const verify = await logseq.Editor.getBlock(inserted.uuid);
+        if (!verify || verify.page?.id !== todayPage.id) {
+          console.warn(
+            "[migrate] post-insert verify failed, leaving source intact",
+            { insertedUuid: inserted.uuid, verifyPageId: verify?.page?.id },
+          );
+          skipped++;
+          continue;
+        }
+        await logseq.Editor.removeBlock(b.uuid);
+        prevUuid = inserted.uuid;
         moved++;
       }
-      const refreshed = await logseq.Editor.getBlock(b.uuid);
-      if (refreshed) prevUuid = refreshed.uuid;
     } catch (e) {
       console.error("[migrate] failed for block", b.uuid, e);
       skipped++;
     }
   }
 
-  await logseq.updateSettings({ lastMigratedDate: String(todayDay) });
+  console.info("[migrate] done", { moved, skipped });
+  if (moved > 0) {
+    await logseq.updateSettings({ lastMigratedDate: String(todayDay) });
+  }
   return { moved, skipped };
 }
 
-async function runWithToast() {
+async function runWithToast(opts: { verbose?: boolean } = {}) {
   try {
-    const { moved, skipped } = await migrate();
+    const { moved, skipped, reason } = await migrate();
     if (moved > 0 || skipped > 0) {
       logseq.UI.showMsg(
         `Migrate: moved ${moved}${skipped ? `, skipped ${skipped}` : ""}`,
         skipped ? "warning" : "success",
+      );
+    } else if (opts.verbose) {
+      logseq.UI.showMsg(
+        `Migrate: nothing to move${reason ? ` (${reason})` : ""}`,
+        "info",
       );
     }
   } catch (e) {
@@ -245,10 +334,12 @@ async function runWithToast() {
 
 function main() {
   logseq.useSettingsSchema(settingsSchema);
+  console.info("[migrate] plugin loaded");
 
   logseq.App.onRouteChanged(({ path }) => {
     if (!path) return;
     if (/\/page\//.test(path) || path === "/" || /journals/i.test(path)) {
+      console.info("[migrate] route change trigger", path);
       void runWithToast();
     }
   });
@@ -257,18 +348,18 @@ function main() {
 
   logseq.Editor.registerSlashCommand("Migrate undone now", async () => {
     await logseq.updateSettings({ lastMigratedDate: "" });
-    await runWithToast();
+    await runWithToast({ verbose: true });
   });
 
   logseq.App.registerCommandPalette(
     { key: "migrate-run-now", label: "Migrate: run now" },
     async () => {
       await logseq.updateSettings({ lastMigratedDate: "" });
-      await runWithToast();
+      await runWithToast({ verbose: true });
     },
   );
 
-  setTimeout(() => void runWithToast(), 0);
+  setTimeout(() => void runWithToast(), 800);
 }
 
 logseq.ready(main).catch(console.error);
