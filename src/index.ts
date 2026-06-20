@@ -359,6 +359,27 @@ async function migrate(opts: { force?: boolean } = {}): Promise<{
         console.warn("[migrate] removeBlock failed", uuid, e);
       }
     }
+
+    const scaffoldUuids = [...insertedMap.keys()].filter(
+      (u) => !targetSet.has(u),
+    );
+    scaffoldUuids.sort(
+      (a, b) => (pageTreeIndex.get(b) ?? 0) - (pageTreeIndex.get(a) ?? 0),
+    );
+    for (const uuid of scaffoldUuids) {
+      try {
+        const block = (await logseq.Editor.getBlock(uuid, {
+          includeChildren: true,
+        })) as BlockEntity | null;
+        if (!block) continue;
+        const children = (block.children ?? []) as BlockEntity[];
+        if (children.length === 0) {
+          await logseq.Editor.removeBlock(uuid);
+        }
+      } catch (e) {
+        console.warn("[migrate] scaffold removeBlock failed", uuid, e);
+      }
+    }
   }
 
   console.info("[migrate] done", { moved, skipped });
