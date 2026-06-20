@@ -120,6 +120,20 @@ async function findUndoneBlocks(
   return res.flat();
 }
 
+async function getAncestorChain(b: BlockEntity): Promise<BlockEntity[]> {
+  const chain: BlockEntity[] = [b];
+  let cur: BlockEntity = b;
+  while (cur.parent && cur.page && cur.parent.id !== cur.page.id) {
+    const parent = (await logseq.Editor.getBlock(
+      cur.parent.id,
+    )) as BlockEntity | null;
+    if (!parent) break;
+    chain.unshift(parent);
+    cur = parent;
+  }
+  return chain;
+}
+
 async function findJournalByDay(day: number): Promise<PageEntity | null> {
   const query = `
     [:find (pull ?p [*])
@@ -182,20 +196,20 @@ function ordinalSuffix(n: number): string {
   return s[(v - 20) % 10] || s[v] || s[0];
 }
 
-async function migrate(): Promise<{
+async function migrate(opts: { force?: boolean } = {}): Promise<{
   moved: number;
   skipped: number;
   reason?: string;
 }> {
   const s = (logseq.settings ?? {}) as unknown as Settings;
   const enabled = s.enabled ?? true;
-  if (!enabled) {
+  if (!enabled && !opts.force) {
     console.info("[migrate] disabled in settings");
     return { moved: 0, skipped: 0, reason: "disabled" };
   }
 
   const todayDay = todayJournalDay();
-  if (s.lastMigratedDate === String(todayDay)) {
+  if (!opts.force && s.lastMigratedDate === String(todayDay)) {
     console.info("[migrate] already ran today", { todayDay });
     return { moved: 0, skipped: 0, reason: "already-ran" };
   }
@@ -237,71 +251,113 @@ async function migrate(): Promise<{
   const anchor = tree?.[tree.length - 1];
   const moveStyle = (s.moveStyle ?? "move") as MoveStyle;
 
-  let prevUuid: string | undefined = anchor?.uuid;
+  const targetSet = new Set(filtered.map((b) => b.uuid));
+  const insertedMap = new Map<string, string>();
+  const pageTreeIndex = new Map<string, number>();
+  const seenPages = new Set<number>();
+  for (const b of filtered) {
+    const pid = b.page?.id;
+    if (pid == null || seenPages.has(pid)) continue;
+    seenPages.add(pid);
+    const sourcePage = (await logseq.Editor.getPage(pid)) as PageEntity | null;
+    if (!sourcePage) continue;
+    const sourceTree = await logseq.Editor.getPageBlocksTree(sourcePage.name);
+    let idx = 0;
+    const walk = (nodes: BlockEntity[]) => {
+      for (const n of nodes) {
+        pageTreeIndex.set(n.uuid, idx++);
+        if (n.children?.length) walk(n.children as BlockEntity[]);
+      }
+    };
+    walk(sourceTree ?? []);
+  }
+
+  filtered.sort((a, b) => {
+    const pa = a.page?.id ?? 0;
+    const pb = b.page?.id ?? 0;
+    if (pa !== pb) return pa - pb;
+    return (
+      (pageTreeIndex.get(a.uuid) ?? 0) - (pageTreeIndex.get(b.uuid) ?? 0)
+    );
+  });
+
+  let prevTopUuid: string | undefined = anchor?.uuid;
 
   console.info("[migrate] anchor", { anchorUuid: anchor?.uuid, moveStyle });
   for (const b of filtered) {
-    const content = b.content ?? "";
-    console.info("[migrate] processing", {
-      uuid: b.uuid,
-      content: content.slice(0, 60),
-      pageId: b.page?.id,
-      prevUuid,
-    });
     try {
-      if (moveStyle === "move-with-ref") {
-        const refContent = `((${b.uuid}))`;
-        let inserted: BlockEntity | null = null;
-        if (prevUuid) {
-          inserted = await logseq.Editor.insertBlock(prevUuid, refContent, {
-            sibling: true,
-          });
-        } else {
-          inserted = await logseq.Editor.appendBlockInPage(
-            todayPage.name,
-            refContent,
-          );
+      const chain = await getAncestorChain(b);
+      console.info("[migrate] processing", {
+        uuid: b.uuid,
+        content: (b.content ?? "").slice(0, 60),
+        pageId: b.page?.id,
+        chainLen: chain.length,
+      });
+      let parentTodayUuid: string | undefined;
+      let failed = false;
+      for (let i = 0; i < chain.length; i++) {
+        const node = chain[i];
+        const existing = insertedMap.get(node.uuid);
+        if (existing) {
+          parentTodayUuid = existing;
+          continue;
         }
-        if (inserted) prevUuid = inserted.uuid;
-        moved++;
-      } else {
+        const isTarget = targetSet.has(node.uuid);
+        const isTop = i === 0;
+        const content =
+          isTarget && moveStyle === "move-with-ref"
+            ? `((${node.uuid}))`
+            : node.content ?? "";
         let inserted: BlockEntity | null = null;
-        if (prevUuid) {
-          console.info("[migrate] insertBlock copy", {
-            target: prevUuid,
-            len: content.length,
-          });
-          inserted = await logseq.Editor.insertBlock(prevUuid, content, {
-            sibling: true,
-          });
+        if (isTop) {
+          if (prevTopUuid) {
+            inserted = await logseq.Editor.insertBlock(prevTopUuid, content, {
+              sibling: true,
+            });
+          } else {
+            inserted = await logseq.Editor.appendBlockInPage(
+              todayPage.name,
+              content,
+            );
+          }
         } else {
-          console.info("[migrate] appendBlockInPage copy");
-          inserted = await logseq.Editor.appendBlockInPage(
-            todayPage.name,
+          inserted = await logseq.Editor.insertBlock(
+            parentTodayUuid!,
             content,
+            { sibling: false },
           );
         }
         if (!inserted) {
-          console.warn("[migrate] insert returned null, leaving source intact");
-          skipped++;
-          continue;
+          console.warn("[migrate] insert returned null", { uuid: node.uuid });
+          failed = true;
+          break;
         }
-        const verify = await logseq.Editor.getBlock(inserted.uuid);
-        if (!verify || verify.page?.id !== todayPage.id) {
-          console.warn(
-            "[migrate] post-insert verify failed, leaving source intact",
-            { insertedUuid: inserted.uuid, verifyPageId: verify?.page?.id },
-          );
-          skipped++;
-          continue;
-        }
-        await logseq.Editor.removeBlock(b.uuid);
-        prevUuid = inserted.uuid;
-        moved++;
+        insertedMap.set(node.uuid, inserted.uuid);
+        parentTodayUuid = inserted.uuid;
+        if (isTop) prevTopUuid = inserted.uuid;
       }
+      if (failed) {
+        skipped++;
+        continue;
+      }
+      moved++;
     } catch (e) {
       console.error("[migrate] failed for block", b.uuid, e);
       skipped++;
+    }
+  }
+
+  if (moveStyle === "move") {
+    const toRemove = [...targetSet].filter((u) => insertedMap.has(u));
+    toRemove.sort(
+      (a, b) => (pageTreeIndex.get(b) ?? 0) - (pageTreeIndex.get(a) ?? 0),
+    );
+    for (const uuid of toRemove) {
+      try {
+        await logseq.Editor.removeBlock(uuid);
+      } catch (e) {
+        console.warn("[migrate] removeBlock failed", uuid, e);
+      }
     }
   }
 
@@ -312,9 +368,9 @@ async function migrate(): Promise<{
   return { moved, skipped };
 }
 
-async function runWithToast(opts: { verbose?: boolean } = {}) {
+async function runWithToast(opts: { verbose?: boolean; force?: boolean } = {}) {
   try {
-    const { moved, skipped, reason } = await migrate();
+    const { moved, skipped, reason } = await migrate({ force: opts.force });
     if (moved > 0 || skipped > 0) {
       logseq.UI.showMsg(
         `Migrate: moved ${moved}${skipped ? `, skipped ${skipped}` : ""}`,
@@ -347,15 +403,13 @@ function main() {
   logseq.App.onCurrentGraphChanged(() => void runWithToast());
 
   logseq.Editor.registerSlashCommand("Migrate undone now", async () => {
-    await logseq.updateSettings({ lastMigratedDate: "" });
-    await runWithToast({ verbose: true });
+    await runWithToast({ verbose: true, force: true });
   });
 
   logseq.App.registerCommandPalette(
     { key: "migrate-run-now", label: "Migrate: run now" },
     async () => {
-      await logseq.updateSettings({ lastMigratedDate: "" });
-      await runWithToast({ verbose: true });
+      await runWithToast({ verbose: true, force: true });
     },
   );
 
