@@ -2,6 +2,11 @@
 
 Logseq plugin. Auto-migrate undone TODOs into today's journal on open. No manual trigger needed.
 
+## Install
+
+- **Logseq Marketplace:** open Logseq → **⋯** → **Plugins** → **Marketplace** → search **Migrate**.
+- Source listing: [github.com/logseq/marketplace/tree/master/packages/migrate](https://github.com/logseq/marketplace/tree/master/packages/migrate)
+
 ## Behavior
 
 - Runs on plugin load, route change to a journal page, and graph switch.
